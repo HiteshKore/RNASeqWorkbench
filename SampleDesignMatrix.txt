@@ -1,7 +1,0 @@
-samples	condition	type
-Sample1	control	single-end	
-Sample2	control	single-end
-Sample3	control	single-end
-Sample4	dKD	single-end
-Sample5	dKD	single-end
-Sample6	dKD	single-end

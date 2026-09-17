@@ -1,0 +1,8 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+# Test data
+Test_data/
+# RStudio project
+Differential_expression.Rproj

@@ -1,0 +1,1027 @@
+---
+title: "Differential_expression_analysis"
+date: "`r format(Sys.Date())`"
+output: html_document
+layout: single
+params:
+  directory: NULL
+  data_file: NULL
+  gtf_file: NULL
+  method: "deseq2"
+  group_size: 3
+  batch_effect: FALSE
+  DE_type: "gene"
+  annotations: "gencode"
+---
+
+```{r setup, include=FALSE,warning=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+library(dplyr)
+library(ggplot2)
+library(Biostrings)
+library(stringr)
+library(readr)
+library(tidyr)
+library(DESeq2)
+library(tibble)
+library(ggrepel)
+library(readxl)
+library(sva) #batch effect correction
+library(vsn)
+library(pheatmap)
+library(edgeR)
+library(GenomicFeatures)
+library(rtracklayer)
+library(limma)
+library(edgeR)
+library(openxlsx)
+library(clusterProfiler)
+library(org.Mm.eg.db)   # mouse annotation package — swap for org.Hs.eg.db etc. if not mouse
+library(org.Hs.eg.db)
+
+
+
+
+```
+This script accepts the count data, design matrix and GTF file and performs differential expression analysis
+```{r required_functions, eval=TRUE, echo=TRUE}
+
+
+
+read_de_excel <- function(file_path,required_sheets = c("count_data", "sample_information", "comparisons")) {
+  if (!file.exists(file_path)) {
+    stop("File not found: ", file_path)
+  }
+
+  available_sheets <- excel_sheets(file_path)
+
+  missing_sheets <- setdiff(required_sheets, available_sheets)
+
+  if (length(missing_sheets) > 0) {
+    stop(
+      "The Excel file is missing required sheet(s): ",
+      paste(missing_sheets, collapse = ", "),
+      "\nSheets found in file: ",
+      paste(available_sheets, collapse = ", ")
+    )
+  }
+
+  # All required sheets present -> read them
+  data_list <- list(
+    count_data        = read_excel(file_path, sheet = "count_data"),
+    sample_info       = read_excel(file_path, sheet = "sample_information"),
+    comparisons       = read_excel(file_path, sheet = "comparisons")
+  )
+
+  message("All required sheets found and loaded successfully.")
+  return(data_list)
+}
+
+library(readxl)
+library(dplyr)
+
+## ---- 1. Validate count_data ------------------------------------------------
+
+validate_count_data <- function(count_data) {
+
+  problems <- character(0)
+
+  # Check first column name
+  first_col_name <- names(count_data)[1]
+  if (!(first_col_name == "Geneid")) {
+    problems <- c(problems, paste0("First column should be Geneid"))
+  }
+
+  # Check first column values are character and unique
+  first_col_vals <- count_data[[1]]
+  if (!is.character(first_col_vals)) {
+    problems <- c(problems, paste0(
+      "First column ('", first_col_name, "') should contain character gene IDs, but is of class: ",class(first_col_vals)[1]
+    ))
+  }
+  if (any(duplicated(first_col_vals))) {
+    problems <- c(problems, paste0("First column ('", first_col_name, "') contains duplicate gene IDs: ",sum(duplicated(first_col_vals)), " duplicate(s) found"))
+  }
+
+  # Check remaining columns are numeric
+  count_cols <- count_data[, -1, drop = FALSE]
+  non_numeric_cols <- names(count_cols)[!sapply(count_cols, is.numeric)]
+  if (length(non_numeric_cols) > 0) {
+    problems <- c(problems, paste0(
+      "The following count columns are not numeric: ",
+      paste(non_numeric_cols, collapse = ", ")
+    ))
+  }
+
+  # Check for negative values (counts shouldn't be negative)
+  numeric_cols <- count_cols[sapply(count_cols, is.numeric)]
+  if (ncol(numeric_cols) > 0) {
+    has_negative <- sapply(numeric_cols, function(x) any(x < 0, na.rm = TRUE))
+    if (any(has_negative)) {
+      problems <- c(problems, paste0(
+        "Negative values found in column(s): ",
+        paste(names(numeric_cols)[has_negative], collapse = ", ")
+      ))
+    }
+  }
+  # Check for missing values
+  na_cols <- names(count_data)[sapply(count_data, function(x) any(is.na(x)))]
+  if (length(na_cols) > 0) {
+    problems <- c(problems, paste0(
+      "Missing (NA) values found in column(s): ",
+      paste(na_cols, collapse = ", ")
+    ))
+  }
+
+  if (length(problems) > 0) {
+    stop("count_data validation failed:\n- ", paste(problems, collapse = "\n- "))
+  }
+
+  message("count_data validated successfully. Gene ID column: '", first_col_name, "'")
+  invisible(TRUE)
+}
+
+
+## ---- 2. Validate sample_information ----------------------------------------
+validate_sample_info <- function(sample_info,required_cols = c("sample", "condition", "batch", "group"),count_data = NULL) {
+
+  problems <- character(0)
+
+  missing_cols <- setdiff(required_cols, names(sample_info))
+  if (length(missing_cols) > 0) {
+    problems <- c(problems, paste0(
+      "Missing required column(s): ", paste(missing_cols, collapse = ", ")
+    ))
+  }
+
+  if ("sample" %in% names(sample_info)) {
+    if (any(duplicated(sample_info$sample))) {
+      problems <- c(problems, "Duplicate sample names found in 'sample' column")
+    }
+# Cross-check sample names against count_data column headers, if provided
+    if (!is.null(count_data)) {
+      count_samples <- names(count_data)[-1]
+      missing_in_counts <- setdiff(sample_info$sample, count_samples)
+      missing_in_info    <- setdiff(count_samples, sample_info$sample)
+
+      if (length(missing_in_counts) > 0) {
+        problems <- c(problems, paste0(
+          "Sample(s) in sample_information not found as columns in count_data: ",
+          paste(missing_in_counts, collapse = ", ")
+        ))
+      }
+      if (length(missing_in_info) > 0) {
+        problems <- c(problems, paste0(
+          "Sample column(s) in count_data not found in sample_information: ",
+          paste(missing_in_info, collapse = ", ")
+        ))
+      }
+    }
+  }
+}
+
+## ---- 3. Validate comparisons -------------------------------------------------
+
+validate_comparisons <- function(comparisons,required_cols = c("Comparisons", "Control", "Test"),sample_info = NULL) {
+
+  problems <- character(0)
+
+  missing_cols <- setdiff(required_cols, names(comparisons))
+  if (length(missing_cols) > 0) {
+    problems <- c(problems, paste0(
+      "Missing required column(s): ", paste(missing_cols, collapse = ", ")
+    ))
+  }
+
+  if ("Comparisons" %in% names(comparisons)) {
+    if (any(duplicated(comparisons$Comparisons))) {
+      problems <- c(problems, "Duplicate comparison names found in 'Comparisons' column")
+    }
+  }
+   # Check Control/Test values exist somewhere in sample_information (condition or group)
+  if (!is.null(sample_info) && all(c("Control", "Test") %in% names(comparisons))) {
+    valid_values <- unique(c(sample_info$condition, sample_info$group))
+
+    bad_control <- setdiff(comparisons$Control, valid_values)
+    bad_test    <- setdiff(comparisons$Test, valid_values)
+
+    if (length(bad_control) > 0) {
+      problems <- c(problems, paste0(
+        "Control value(s) not found in sample_information's condition/group columns: ",
+        paste(bad_control, collapse = ", ")
+      ))
+    }
+    if (length(bad_test) > 0) {
+      problems <- c(problems, paste0(
+        "Test value(s) not found in sample_information's condition/group columns: ",
+        paste(bad_test, collapse = ", ")
+      ))
+    }
+  }
+if (length(problems) > 0) {
+    stop("comparisons validation failed:\n- ", paste(problems, collapse = "\n- "))
+  }
+
+  message("comparisons validated successfully.")
+  invisible(TRUE)
+}
+
+## ---- 5. Align count_data column order to sample_information ---------------
+
+align_counts_to_sample_info <- function(count_data, sample_info) {
+
+  gene_id_col <- names(count_data)[1]
+
+  # Set gene IDs as rownames, keep only count columns
+  counts_mat <- count_data %>%
+    column_to_rownames(var = gene_id_col) %>%
+    as.data.frame()
+
+  # Reorder/subset columns to match sample_info$sample exactly
+  missing_samples <- setdiff(sample_info$sample, colnames(counts_mat))
+  if (length(missing_samples) > 0) {
+    stop("Sample(s) in sample_information not found in count_data: ",
+         paste(missing_samples, collapse = ", "))
+  }
+
+  counts_mat <- counts_mat[, sample_info$sample, drop = FALSE]
+
+  # Sanity check: order now matches exactly
+  if (!identical(colnames(counts_mat), sample_info$sample)) {
+    stop("Column ordering could not be aligned to sample_information$sample")
+  }
+  
+
+  message("count_data aligned to sample_information (", ncol(counts_mat), " samples, ",
+          nrow(counts_mat), " genes).")
+
+  return(counts_mat)
+}
+
+## ---- 6. Wrapper: read + validate everything ---------------------------------
+
+read_and_validate_de_excel <- function(file_path) {
+
+  # (reuses read_de_excel from before to check sheets exist + read them)
+  de_data <- read_de_excel(file_path)
+
+  validate_count_data(de_data$count_data)
+  validate_sample_info(de_data$sample_info, count_data = de_data$count_data)
+  validate_comparisons(de_data$comparisons, sample_info = de_data$sample_info)
+
+  message("All tabs validated successfully.")
+  return(de_data)
+}
+
+
+## ---- 5. Run DE analysis for every row in the comparisons tab --------------
+run_de_for_comparisons_deseq <- function(counts_mat, sample_info, comparisons,group_col = "condition",
+                                    alpha = 0.05,log2fc_cutoff = 1,gene_info = NULL,gene_info_id_col = "gene_id",correct_batch = FALSE,group_size = 3) {
+
+  if (!(group_col %in% names(sample_info))) {
+    stop("group_col '", group_col, "' not found in sample_information. ",
+         "Available columns: ", paste(names(sample_info), collapse = ", "))
+  }
+
+  # Validate gene_info up front, if provided
+  if (!is.null(gene_info)) {
+    if (!(gene_info_id_col %in% names(gene_info))) {
+      stop("gene_info_id_col '", gene_info_id_col, "' not found in gene_info. ",
+           "Available columns: ", paste(names(gene_info), collapse = ", "))
+    }
+    if (any(duplicated(gene_info[[gene_info_id_col]]))) {
+      warning("gene_info contains duplicate '", gene_info_id_col,
+              "' values — merge may produce duplicate rows in results.")
+    }
+  }
+  
+  if (!is.numeric(group_size) ||
+      length(group_size) != 1 || is.na(group_size) ||group_size < 1) {
+    stop("'group_size' must be a single positive integer.")
+  }
+  
+
+  group_size <- as.integer(group_size)
+  
+   if (!is.logical(correct_batch) || length(correct_batch) != 1) {
+    stop("'correct_batch' must be TRUE or FALSE.")
+   }
+  
+  if (correct_batch && !("batch" %in% names(sample_info))) {
+    stop(
+      "correct_batch = TRUE, but 'batch' column was not found in sample_info."
+    )
+  }
+
+  results_list <- list()
+
+  for (i in seq_len(nrow(comparisons))) {
+
+    comp_name <- comparisons$Comparisons[i]
+    ctrl_grp  <- comparisons$Control[i]
+    test_grp  <- comparisons$Test[i]
+
+    message("\nRunning comparison: ", comp_name,
+            " (Test = ", test_grp, " vs Control = ", ctrl_grp, ")")
+
+    # Subset sample_info to just the two groups in this comparison
+    sub_info <- sample_info %>%
+      filter(.data[[group_col]] %in% c(ctrl_grp, test_grp))
+
+    if (nrow(sub_info) == 0) {
+      warning("No matching samples found for comparison '", comp_name,
+               "' — skipping.")
+      next
+    }
+
+    missing_grp <- setdiff(c(ctrl_grp, test_grp), unique(sub_info[[group_col]]))
+    if (length(missing_grp) > 0) {
+      warning("Comparison '", comp_name, "' — group(s) not found in sample_information: ",
+               paste(missing_grp, collapse = ", "), " — skipping.")
+      next
+    }
+
+    # Subset & align counts to just these samples, in sub_info's order
+    sub_counts <- counts_mat[, sub_info$sample, drop = FALSE]
+    
+    print(sub_counts)
+
+    # Set factor levels explicitly so Test is compared vs Control (reference)
+    sub_info[[group_col]] <- factor(sub_info[[group_col]], levels = c(ctrl_grp, test_grp))
+    print(sub_info[[group_col]])
+    # Build design formula — adjust for batch if present and has >1 level
+    if ("batch" %in% names(sub_info) && length(unique(sub_info$batch)) > 1) {
+      design_formula <- as.formula(paste("~ batch +", group_col))
+    } else {
+      design_formula <- as.formula(paste("~", group_col))
+    }
+
+     dds <- DESeqDataSetFromMatrix(
+       countData = round(sub_counts),   # DESeq2 requires integer counts
+       colData   = sub_info,
+       design    = design_formula
+     )
+   
+     # Remove genes with all-zero counts across these samples
+     keep <- rowSums(sub_counts > 10) >= group_size
+     
+     dds <- dds[keep,]
+
+   
+     dds <- DESeq(dds)
+
+   
+     res <- results(dds,
+                     contrast = c(group_col, test_grp, ctrl_grp),
+                     alpha = alpha)
+
+    res_df <- as.data.frame(res) %>%
+      rownames_to_column(var = "Geneid") %>%
+      arrange(padj)
+
+    # ---- Add up/down/not-significant annotation ----
+    res_df <- res_df %>%
+      mutate(
+        regulation = case_when(
+          is.na(padj)                                     ~ "Not significant",
+          padj < alpha & log2FoldChange >=  log2fc_cutoff  ~ "Upregulated",
+          padj < alpha & log2FoldChange <= -log2fc_cutoff  ~ "Downregulated",
+          TRUE                                             ~ "Not significant"
+        )
+      )
+
+    # ---- Merge in gene annotation info, if provided ----
+    if (!is.null(gene_info)) {
+      n_before <- nrow(res_df)
+
+      res_df <- res_df %>%
+        left_join(gene_info, by = c("Geneid" = gene_info_id_col)) %>%
+        relocate(any_of(setdiff(names(gene_info), gene_info_id_col)), .after = Geneid)
+
+      n_unmatched <- sum(!res_df$Geneid %in% gene_info[[gene_info_id_col]])
+      if (n_unmatched > 0) {
+        message("  Note: ", n_unmatched, " gene(s) had no match in gene_info")
+      }
+      if (nrow(res_df) != n_before) {
+        warning("Comparison '", comp_name,
+                "': row count changed after merging gene_info (check for duplicate IDs).")
+      }
+    }
+
+    results_list[[comp_name]] <- list(
+      dds     = dds,
+      results = res_df
+    )
+
+    n_up   <- sum(res_df$regulation == "Upregulated")
+    n_down <- sum(res_df$regulation == "Downregulated")
+
+    message("  -> ", n_up, " upregulated, ", n_down, " downregulated ",
+            "(padj < ", alpha, ", |log2FC| >= ", log2fc_cutoff, ")")
+  }
+
+  return(results_list)
+}
+
+## ---- 6. Run DE analysis using edgeR --------------
+
+run_de_for_comparisons_edgeR <- function(counts_mat, sample_info, comparisons,
+                                          group_col = "condition",
+                                          alpha = 0.05,
+                                          log2fc_cutoff = 1,
+                                          gene_info = NULL,
+                                          gene_info_id_col = "gene_id",
+                                          test_method = c("qlf", "lrt", "exact")) {
+
+  test_method <- match.arg(test_method)
+
+  if (!(group_col %in% names(sample_info))) {
+    stop("group_col '", group_col, "' not found in sample_information. ",
+         "Available columns: ", paste(names(sample_info), collapse = ", "))
+  }
+
+  # Validate gene_info up front, if provided
+  if (!is.null(gene_info)) {
+    if (!(gene_info_id_col %in% names(gene_info))) {
+      stop("gene_info_id_col '", gene_info_id_col, "' not found in gene_info. ",
+           "Available columns: ", paste(names(gene_info), collapse = ", "))
+    }
+    if (any(duplicated(gene_info[[gene_info_id_col]]))) {
+      warning("gene_info contains duplicate '", gene_info_id_col,
+              "' values — merge may produce duplicate rows in results.")
+    }
+  }
+
+  results_list <- list()
+
+  for (i in seq_len(nrow(comparisons))) {
+
+    comp_name <- comparisons$Comparisons[i]
+    ctrl_grp  <- comparisons$Control[i]
+    test_grp  <- comparisons$Test[i]
+
+    message("\nRunning comparison: ", comp_name,
+            " (Test = ", test_grp, " vs Control = ", ctrl_grp, ")")
+
+    # Subset sample_info to just the two groups in this comparison
+    sub_info <- sample_info %>%
+      filter(.data[[group_col]] %in% c(ctrl_grp, test_grp))
+
+    if (nrow(sub_info) == 0) {
+      warning("No matching samples found for comparison '", comp_name,
+               "' — skipping.")
+      next
+    }
+
+    missing_grp <- setdiff(c(ctrl_grp, test_grp), unique(sub_info[[group_col]]))
+    if (length(missing_grp) > 0) {
+      warning("Comparison '", comp_name, "' — group(s) not found in sample_information: ",
+               paste(missing_grp, collapse = ", "), " — skipping.")
+      next
+    }
+
+    # Subset & align counts to just these samples, in sub_info's order
+    sub_counts <- counts_mat[, sub_info$sample, drop = FALSE]
+
+    # Set factor levels explicitly so Test is compared vs Control (reference)
+    group_factor <- factor(sub_info[[group_col]], levels = c(ctrl_grp, test_grp))
+
+    # Build design formula — adjust for batch if present and has >1 level
+    use_batch <- "batch" %in% names(sub_info) && length(unique(sub_info$batch)) > 1
+
+    if (use_batch && test_method == "exact") {
+      warning("Comparison '", comp_name,
+              "': batch correction requested but not supported by exact test — ",
+              "switching to QLF for this comparison.")
+      this_method <- "qlf"
+    } else {
+      this_method <- test_method
+    }
+
+    # ---- Build DGEList ----
+    dge <- DGEList(counts = round(sub_counts), group = group_factor)
+
+    # Filter low-count genes (standard edgeR practice)
+    keep <- filterByExpr(dge, group = group_factor)
+    dge  <- dge[keep, , keep.lib.sizes = FALSE]
+
+    # Normalize (TMM)
+    dge <- calcNormFactors(dge)
+
+    if (this_method == "exact") {
+      # Classic exact test — simplest, no design matrix / batch support
+      dge <- estimateDisp(dge)
+      et  <- exactTest(dge, pair = c(ctrl_grp, test_grp))
+      tt  <- topTags(et, n = Inf, sort.by = "PValue")$table
+
+    } else {
+      # QLF or LRT — supports batch correction via design matrix
+      if (use_batch) {
+        batch_factor  <- factor(sub_info$batch)
+        design_matrix <- model.matrix(~ batch_factor + group_factor)
+      } else {
+        design_matrix <- model.matrix(~ group_factor)
+      }
+
+      dge <- estimateDisp(dge, design = design_matrix)
+      coef_name <- tail(colnames(design_matrix), 1)  # last coef = test vs control
+
+      if (this_method == "qlf") {
+        fit <- glmQLFit(dge, design_matrix)
+        qlf <- glmQLFTest(fit, coef = coef_name)
+        tt  <- topTags(qlf, n = Inf, sort.by = "PValue")$table
+      } else {  # lrt
+        fit <- glmFit(dge, design_matrix)
+        lrt <- glmLRT(fit, coef = coef_name)
+        tt  <- topTags(lrt, n = Inf, sort.by = "PValue")$table
+      }
+    }
+
+    res_df <- tt %>%
+      rownames_to_column(var = "Geneid") %>%
+      rename(
+        log2FoldChange = logFC,
+        pvalue         = PValue,
+        padj           = FDR
+      ) %>%
+      arrange(padj)
+
+    # ---- Add up/down/not-significant annotation ----
+    res_df <- res_df %>%
+      mutate(
+        regulation = case_when(
+          is.na(padj)                                     ~ "Not significant",
+          padj < alpha & log2FoldChange >=  log2fc_cutoff  ~ "Upregulated",
+          padj < alpha & log2FoldChange <= -log2fc_cutoff  ~ "Downregulated",
+          TRUE                                             ~ "Not significant"
+        )
+      )
+
+    # ---- Merge in gene annotation info, if provided ----
+    if (!is.null(gene_info)) {
+      n_before <- nrow(res_df)
+
+      res_df <- res_df %>%
+        left_join(gene_info, by = c("Geneid" = gene_info_id_col)) %>%
+        relocate(any_of(setdiff(names(gene_info), gene_info_id_col)), .after = Geneid)
+
+      n_unmatched <- sum(!res_df$Geneid %in% gene_info[[gene_info_id_col]])
+      if (n_unmatched > 0) {
+        message("  Note: ", n_unmatched, " gene(s) had no match in gene_info")
+      }
+      if (nrow(res_df) != n_before) {
+        warning("Comparison '", comp_name,
+                "': row count changed after merging gene_info (check for duplicate IDs).")
+      }
+    }
+
+    results_list[[comp_name]] <- list(
+      dge     = dge,
+      results = res_df
+    )
+
+    n_up   <- sum(res_df$regulation == "Upregulated")
+    n_down <- sum(res_df$regulation == "Downregulated")
+
+    message("  -> ", n_up, " upregulated, ", n_down, " downregulated ",
+            "(padj < ", alpha, ", |log2FC| >= ", log2fc_cutoff, ", method = ", this_method, ")")
+  }
+
+  return(results_list)
+}
+
+
+
+##GSEA analysis
+## ---- Helper: resolve organism -> org_db + KEGG code ------------------------
+
+get_organism_resources <- function(organism = c("mouse", "human")) {
+
+  organism <- match.arg(organism)
+
+  if (organism == "mouse") {
+    list(org_db = org.Mm.eg.db, kegg_code = "mmu")
+  } else if (organism == "human") {
+    list(org_db = org.Hs.eg.db, kegg_code = "hsa")
+  }
+}
+
+## ---- 1. Prepare a ranked gene list from DE results -------------------------
+
+prepare_ranked_genes <- function(DE_df, gene_col, pval_col, logfc_col,
+                                  seed = 123, perturb_range = 1e-6) {
+
+  # Basic sanity checks
+  if (!all(c(gene_col, pval_col, logfc_col) %in% colnames(DE_df))) {
+    stop("One or more specified columns not found in DE_df.")
+  }
+
+  genes    <- DE_df[[gene_col]]
+  adj_pval <- DE_df[[pval_col]]
+  logFC    <- DE_df[[logfc_col]]
+
+  # Report NA breakdown before dropping anything (helps diagnose data issues)
+  n_na_gene  <- sum(is.na(genes) | genes == "")
+  n_na_pval  <- sum(is.na(adj_pval))
+  n_na_logfc <- sum(is.na(logFC))
+  if (n_na_gene + n_na_pval + n_na_logfc > 0) {
+    message("Dropping rows with missing values — gene: ", n_na_gene,
+            ", p-value: ", n_na_pval, ", log2FC: ", n_na_logfc)
+  }
+
+  keep <- !is.na(genes) & genes != "" & !is.na(adj_pval) & !is.na(logFC)
+  genes    <- genes[keep]
+  adj_pval <- adj_pval[keep]
+  logFC    <- logFC[keep]
+
+  # Floor zero p-values to smallest representable double, so -log10() never hits Inf
+  n_zero <- sum(adj_pval == 0)
+  if (n_zero > 0) {
+    warning(n_zero, " p-value(s) exactly 0 — flooring to machine epsilon (",
+            .Machine$double.xmin, ") before ranking, to avoid Inf/-Inf.")
+    adj_pval[adj_pval == 0] <- .Machine$double.xmin
+  }
+
+  # Compute ranking metric: -log10(p) signed by direction of fold change
+  rank_metric <- -log10(adj_pval) * sign(logFC)
+
+  # Add tiny random perturbation to break ties (e.g., many genes with p = 1 or identical stats)
+  set.seed(seed)
+  perturbation <- runif(length(rank_metric), min = -perturb_range, max = perturb_range)
+  rank_metric_perturbed <- rank_metric + perturbation
+
+  # Handle duplicate gene IDs — keep the one with the strongest |rank_metric|
+  n_dup <- sum(duplicated(genes))
+  if (n_dup > 0) {
+    message(n_dup, " duplicate gene ID(s) found — keeping the entry with the strongest ",
+            "rank metric per ID.")
+    dup_df <- data.frame(genes = genes, rank_metric_perturbed = rank_metric_perturbed) %>%
+      group_by(genes) %>%
+      slice_max(order_by = abs(rank_metric_perturbed), n = 1, with_ties = FALSE) %>%
+      ungroup()
+    genes                 <- dup_df$genes
+    rank_metric_perturbed <- dup_df$rank_metric_perturbed
+  }
+
+  # Build named, sorted vector for GSEA (fgsea, clusterProfiler, etc.)
+  ranked_genes <- sort(setNames(rank_metric_perturbed, genes), decreasing = TRUE)
+
+  return(ranked_genes)
+}
+
+## ---- 2. GSEA for a single GO ontology (BP / MF / CC) -----------------------
+
+run_gsea_go <- function(gene_list,
+                         ontology = c("BP", "MF", "CC"),
+                         organism = c("mouse", "human"),
+                         pvalue_cutoff = 0.05,
+                         seed = 42) {
+
+  ontology <- match.arg(ontology)
+  organism <- match.arg(organism)
+  org_db   <- get_organism_resources(organism)$org_db
+
+  set.seed(seed)
+  gsea_res <- gseGO(
+    geneList      = gene_list,
+    OrgDb         = org_db,
+    ont           = ontology,
+    keyType       = "ENTREZID",
+    minGSSize     = 10,
+    maxGSSize     = 500,
+    pvalueCutoff  = pvalue_cutoff,
+    verbose       = FALSE,
+    seed          = TRUE
+  )
+
+  res_df <- as.data.frame(gsea_res) %>% arrange(p.adjust)
+  message("GO-", ontology, ": ", nrow(res_df), " significant terms at padj < ", pvalue_cutoff)
+
+  return(list(gsea_obj = gsea_res, results = res_df))
+}
+
+## ---- 3. GSEA for KEGG pathways ----------------------------------------------
+
+run_gsea_kegg <- function(gene_list,
+                           organism = c("mouse", "human"),
+                           pvalue_cutoff = 0.05,
+                           seed = 42) {
+
+  organism  <- match.arg(organism)
+  kegg_code <- get_organism_resources(organism)$kegg_code
+
+  set.seed(seed)
+  gsea_res <- gseKEGG(
+    geneList      = gene_list,
+    organism      = kegg_code,
+    keyType       = "ncbi-geneid",
+    minGSSize     = 10,
+    maxGSSize     = 500,
+    pvalueCutoff  = pvalue_cutoff,
+    verbose       = FALSE,
+    seed          = TRUE
+  )
+
+  res_df <- as.data.frame(gsea_res) %>% arrange(p.adjust)
+  message("KEGG: ", nrow(res_df), " significant pathways at padj < ", pvalue_cutoff)
+
+  return(list(gsea_obj = gsea_res, results = res_df))
+}
+
+## ---- 4. Wrapper: run all four GSEA analyses for every comparison -----------
+## ---- ID mapping helper (Ensembl -> Entrez), separate from ranking ----------
+
+map_ensembl_to_entrez <- function(res_df, id_col = "Geneid", organism = c("mouse", "human")) {
+
+  organism <- match.arg(organism)
+  org_db   <- get_organism_resources(organism)$org_db
+
+  res_df <- res_df %>%
+    mutate(ensembl_clean = sub("\\..*$", "", .data[[id_col]]))
+
+  id_map <- bitr(res_df$ensembl_clean,
+                  fromType = "ENSEMBL",
+                  toType   = "ENTREZID",
+                  OrgDb    = org_db)
+
+  n_mapped <- nrow(id_map)
+  n_total  <- length(unique(res_df$ensembl_clean))
+  message("Mapped ", n_mapped, " / ", n_total, " gene IDs to Entrez (",
+          round(100 * n_mapped / n_total, 1), "%) [organism = ", organism, "]")
+
+  res_mapped <- res_df %>%
+    inner_join(id_map, by = c("ensembl_clean" = "ENSEMBL"))
+
+  return(res_mapped)
+}
+
+
+## ---- Updated wrapper --------------------------------------------------------
+
+run_gsea_for_all_comparisons <- function(de_results,
+                                          gene_col  = "Geneid",
+                                          pval_col  = "pvalue",
+                                          logfc_col = "log2FoldChange",
+                                          organism = c("mouse", "human"),
+                                          pvalue_cutoff = 0.05,
+                                          seed = 123,
+                                          perturb_range = 1e-6) {
+
+  organism <- match.arg(organism)
+  gsea_results <- list()
+
+  for (comp_name in names(de_results)) {
+
+    message("\n=== GSEA for comparison: ", comp_name, " ===")
+
+    res_df <- de_results[[comp_name]]$results
+
+    # Step 1: map gene IDs to Entrez
+    res_mapped <- map_ensembl_to_entrez(
+      res_df   = res_df,
+      id_col   = gene_col,
+      organism = organism
+    )
+
+    # Step 2: build ranked gene list from mapped data
+    gene_list <- prepare_ranked_genes(
+      DE_df         = res_mapped,
+      gene_col      = "ENTREZID",
+      pval_col      = pval_col,
+      logfc_col     = logfc_col,
+      seed          = seed,
+      perturb_range = perturb_range
+    )
+
+    if (length(gene_list) < 10) {
+      warning("Comparison '", comp_name, "': too few mapped genes (",
+              length(gene_list), ") — skipping GSEA.")
+      next
+    }
+
+    gsea_results[[comp_name]] <- list(
+      BP   = run_gsea_go(gene_list, ontology = "BP", organism = organism, pvalue_cutoff = pvalue_cutoff),
+      MF   = run_gsea_go(gene_list, ontology = "MF", organism = organism, pvalue_cutoff = pvalue_cutoff),
+      CC   = run_gsea_go(gene_list, ontology = "CC", organism = organism, pvalue_cutoff = pvalue_cutoff),
+      KEGG = run_gsea_kegg(gene_list, organism = organism, pvalue_cutoff = pvalue_cutoff)
+    )
+  }
+
+  return(gsea_results)
+}
+
+## ---- . Write results -----------
+
+write_de_and_gsea_to_excel <- function(de_results,
+                                        gsea_results = NULL,
+                                        output_dir,
+                                        prefix = "Results_",
+                                        include_summary_sheet = TRUE) {
+
+  if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+    message("Created output directory: ", output_dir)
+  }
+
+  for (comp_name in names(de_results)) {
+
+    res_df <- de_results[[comp_name]]$results
+
+    if (is.null(res_df) || nrow(res_df) == 0) {
+      warning("Comparison '", comp_name, "' has no DE results — skipping file.")
+      next
+    }
+
+    safe_name <- gsub("[/\\\\:*?\"<>|]", "_", comp_name)
+    file_path <- file.path(output_dir, paste0(prefix, safe_name, ".xlsx"))
+
+    wb <- createWorkbook()
+
+    ## ---------------- DE results sheet ----------------
+    addWorksheet(wb, "DE_results")
+    writeData(wb, "DE_results", res_df, withFilter = TRUE)
+    freezePane(wb, "DE_results", firstRow = TRUE)
+    setColWidths(wb, "DE_results", cols = seq_len(ncol(res_df)),
+                 widths = pmin(pmax(nchar(names(res_df)) + 2, 10), 40))
+
+    ## ---------------- Summary sheet ----------------
+    if (include_summary_sheet) {
+      n_up   <- if ("regulation" %in% names(res_df)) sum(res_df$regulation == "Upregulated", na.rm = TRUE) else NA
+      n_down <- if ("regulation" %in% names(res_df)) sum(res_df$regulation == "Downregulated", na.rm = TRUE) else NA
+      n_ns   <- if ("regulation" %in% names(res_df)) sum(res_df$regulation == "Not significant", na.rm = TRUE) else NA
+
+      has_gsea <- !is.null(gsea_results) && comp_name %in% names(gsea_results)
+
+      summary_df <- data.frame(
+        Metric = c("Comparison", "Total genes tested", "Upregulated", "Downregulated",
+                   "Not significant", "GSEA included"),
+        Value  = c(comp_name, nrow(res_df), n_up, n_down, n_ns, ifelse(has_gsea, "Yes", "No"))
+      )
+
+      if (has_gsea) {
+        gsea_comp <- gsea_results[[comp_name]]
+        for (ont in c("BP", "MF", "CC", "KEGG")) {
+          n_sig <- if (!is.null(gsea_comp[[ont]])) nrow(gsea_comp[[ont]]$results) else NA
+          summary_df <- rbind(summary_df,
+                               data.frame(Metric = paste0(ont, " significant terms"), Value = n_sig))
+        }
+      }
+
+      addWorksheet(wb, "Summary")
+      writeData(wb, "Summary", summary_df, colNames = TRUE)
+      setColWidths(wb, "Summary", cols = 1:2, widths = c(25, 30))
+    }
+## ---------------- GSEA sheets (BP, MF, CC, KEGG) ----------------
+    if (!is.null(gsea_results) && comp_name %in% names(gsea_results)) {
+
+      gsea_comp <- gsea_results[[comp_name]]
+      sheet_map <- c(BP = "GO_BP", MF = "GO_MF", CC = "GO_CC", KEGG = "KEGG")
+
+      for (ont in names(sheet_map)) {
+
+        sheet_name <- sheet_map[[ont]]
+        gsea_df <- gsea_comp[[ont]]$results
+
+        addWorksheet(wb, sheet_name)
+
+        if (is.null(gsea_df) || nrow(gsea_df) == 0) {
+          writeData(wb, sheet_name, data.frame(Message = paste0("No significant ", ont, " terms found")))
+          next
+        }
+writeData(wb, sheet_name, gsea_df, withFilter = TRUE)
+        freezePane(wb, sheet_name, firstRow = TRUE)
+        setColWidths(wb, sheet_name, cols = seq_len(ncol(gsea_df)),
+                     widths = pmin(pmax(nchar(names(gsea_df)) + 2, 10), 50))
+      }
+
+    } else if (!is.null(gsea_results)) {
+      message("Comparison '", comp_name, "' has no GSEA results — DE-only file written.")
+    }
+
+    saveWorkbook(wb, file_path, overwrite = TRUE)
+    message("Saved: ", file_path)
+  }
+
+  message("\nAll comparison(s) written to: ", output_dir)
+  invisible(NULL)
+}
+
+```
+
+
+```{r DE, eval=TRUE, echo=TRUE}
+
+## ---------------------------------------------------------------------------
+## Hardcoded paths/values used during local/interactive development.
+## Kept here for reference — commented out, since these now come from
+## server.R via `params` (rmarkdown::render(params = list(...))).
+## ---------------------------------------------------------------------------
+# de_excel      <- "/Users/hiteshkore/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/Hitesh_parker_lab/github/downstream_transcriptome_analysis/Differential_expression/Test_data/Shoaib/count_data_flt.xlsx"
+# gtf           <- "/Users/hiteshkore/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/Hitesh_parker_lab/Proteogenomics/Databases/gencode.vM37.annotation.gtf"
+# outdir        <- "/Users/hiteshkore/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/Hitesh_parker_lab/github/downstream_transcriptome_analysis/Differential_expression/Test_data/Shoaib/"
+# method        <- 'deseq2'
+# log2fc_cutoff <- 1
+# group_col     <- "condition"
+
+## ---------------------------------------------------------------------------
+## Receive parameters passed in from server.R
+## (via rmarkdown::render(params = list(directory=..., data_file=..., ...)))
+## ---------------------------------------------------------------------------
+de_excel     <- params$data_file        # uploaded Excel workbook (count_data / sample_information / comparisons tabs)
+gtf          <- params$gtf_file         # uploaded GTF file
+outdir       <- params$directory        # session-specific output directory (server.R creates this)
+method       <- params$method           # "DeSeq2" or "edgeR", as selected in the UI
+group_size   <- as.numeric(params$group_size)
+batch_effect <- isTRUE(params$batch_effect)   # not yet functional downstream — collected for later use
+DE_type      <- params$DE_type                # not yet functional downstream — collected for later use
+annotations  <- params$annotations            # not yet functional downstream — collected for later use
+group_col     <- "condition"
+log2fc_cutoff <- 1
+pvalue        <- 0.05
+
+# Normalize the method string coming from the UI's selectInput ("DeSeq2" -> "deseq2", "edgeR" -> "edgeR")
+method <- dplyr::case_when(
+  grepl("deseq", method, ignore.case = TRUE) ~ "deseq2",
+  grepl("edger", method, ignore.case = TRUE) ~ "edgeR",
+  TRUE ~ method
+)
+
+
+
+print(de_excel)
+print(gtf)
+print(outdir)
+print(method)
+print(group_size)
+print(batch_effect)
+print(DE_type)
+print(annotations)
+
+if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
+
+gtf_data = import(gtf, format = "gtf")
+
+gene_annotations <- data.frame(
+  gene_id = mcols(gtf_data)$gene_id,
+  gene_name = mcols(gtf_data)$gene_name,
+  gene_biotype = mcols(gtf_data)$gene_type
+)%>%unique()
+
+# Load + validate (from before)
+de_data<-read_and_validate_de_excel(de_excel)
+
+count_data  <- de_data$count_data
+sample_info <- de_data$sample_info
+comparisons <- de_data$comparisons
+
+# Align counts to sample_information order
+counts_mat <- align_counts_to_sample_info(de_data$count_data, de_data$sample_info)
+
+
+  if (method == "deseq2") {
+
+    message("Running differential expression using DESeq2...")
+
+    de_results <- run_de_for_comparisons_deseq(
+      counts_mat    = counts_mat,
+      sample_info   = sample_info,
+      comparisons   = comparisons,
+      group_col     = group_col,
+      alpha         = pvalue,
+      log2fc_cutoff = log2fc_cutoff,
+      gene_info     = gene_annotations,
+      correct_batch = batch_effect,
+      group_size    = group_size
+    )
+
+  } else if (method == "edgeR") {
+
+    message("Running differential expression using edgeR (test_method = 'qlf')...")
+
+    de_results <- run_de_for_comparisons_edgeR(
+      counts_mat    = counts_mat,
+      sample_info   = sample_info,
+      comparisons   = comparisons,
+      group_col     = group_col,
+      alpha         = pvalue,
+      log2fc_cutoff = log2fc_cutoff,
+      gene_info     = gene_annotations,
+      test_method   = "qlf",     # "qlf" (recommended default), "lrt", or "exact"
+      correct_batch = batch_effect,
+      group_size    = group_size
+    )
+
+  } else {
+    stop("Unsupported method: '", method, "'. Must be 'deseq2' or 'edgeR'.")
+  }
+
+gsea_results<-run_gsea_for_all_comparisons(de_results,gene_col  = "Geneid",pval_col  = "pvalue",logfc_col = "log2FoldChange",organism = "mouse") 
+
+write_de_and_gsea_to_excel(
+  de_results   = de_results,
+  gsea_results = gsea_results,
+  output_dir   = outdir
+)
+
+```
