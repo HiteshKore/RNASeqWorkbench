@@ -3,7 +3,7 @@ library(shinydashboard)
 library(shinyjs)
 
 ui <- dashboardPage(
-  dashboardHeader(title = "transcriptome analysis",
+  dashboardHeader(title = "RNA-seqWorkbench",
                   dropdownMenu(type = "messages",
                                tags$li(HTML('<li><a href="mailto:hitesh.kore22@gmail.com" target="_blank"><i class="fa fa-question"></i><h4>Support</h4><p>hitesh.kore22@gmail.com</p></a></li>'))
                   )),
@@ -11,7 +11,7 @@ ui <- dashboardPage(
   dashboardSidebar(
     sidebarMenu(menuItem("Welcome", tabName = "welcome", icon = icon("house")),
                 menuItem("Differential expression", tabName = "de_analysis", icon = icon("dna")),
-                menuItem("GSEA analysis", tabName = "gsea_analysis", icon = icon("database"))
+                menuItem("GSEA visualisations", tabName = "gsea_visualisations", icon = icon("chart-line"))
     )
   ),
   # body
@@ -121,18 +121,17 @@ ui <- dashboardPage(
                        selectInput("annotations", label = "Annotations:", 
                                    choices = list("refseq" = "refseq","gencode" = "gencode"),selected = "gencode"),
                        
-                       actionButton("db_submit_button", "Submit", class = "btn btn-primary")
+                       actionButton("de_submit_button", "Submit", class = "btn btn-primary")
                 )
     )
   ),
-  tabItem(tabName = "gsea_analysis", 
+  tabItem(tabName = "gsea_visualisations", 
           h2("Gene set enrichment analysis"),
           fluidRow(
             column(6,
-                   fileInput("DE_results", "Upload DE results files:", NULL, buttonLabel = "Browse...", multiple = TRUE),
-                   selectInput("ranked_genes", label = "Select gene list:", 
-                               choices = list("ranked_genes" = "ranked_genes","de_genes" = "de_genes"),selected = "ranked_genes"),
-              
+                   fileInput("DE_GSEA_results","Upload DE and GSEA results Excel file:",NULL,buttonLabel = "Browse...",multiple = FALSE,accept = c(".xlsx")),
+                   selectInput("gsea_method", label = "Differential expression method used:",
+                               choices = list("DeSeq2" = "deseq", "edgeR" = "edger"), selected = "deseq"),
                    actionButton("gsea_submit_button", "Submit", class = "btn btn-primary")
                    
             )

@@ -5,7 +5,7 @@ library(shinyjs)
 options(shiny.maxRequestSize = 2000*1024^2)
 
 # internal server functions
-differential_expr_server <- function(input, output, session) {
+server_differential_expr <- function(input, output, session) {
   
   req(input$de_excel$datapath, input$GTF$datapath)  # required
   
@@ -105,22 +105,73 @@ differential_expr_server <- function(input, output, session) {
   invisible(list(command = full_command, log = result, status = exit_status))
 }
 #gsea analysis server
-gsea_analysis<-function(input, output, session){
-  req(input$DE_results)
+server_gsea_analysis<-function(input, output, session){
+  req("DE_GSEA_results")
   
   # store session ID
   session_id <- session$token
-  outdir_gsea <- paste0(session_id, "/gsea_results")
-  system(paste0("mkdir ", outdir_gsea))
+  outdir_gsea <- paste0(session_id, "/gsea_results_visualisations")
+  dir.create(outdir_gsea, recursive = TRUE, showWarnings = FALSE)
+  
+  # ---- Collect all options from the UI ----
+  de_res_fn <- input$DE_GSEA_results$datapath
+  method    <- input$gsea_method
+
   working_dir <- getwd()
-  print(input$DE_results)
-  rmarkdown::render(input = paste0(working_dir,"/bin/GSEA_analysis.Rmd"),
-                    output_file = paste0(working_dir,"/",outdir_gsea,"/summary_report.html"),
-                    output_format = "html_document",
-                    params = list(
-                      directory = paste0(working_dir,"/",outdir_gsea,"/"),
-                      data_files=input$DE_results
-                    ))
+  rmd_path    <- file.path(working_dir, "bin", "DE_GSEA_plotting.Rmd")
+  outdir_full <- file.path(working_dir, outdir_gsea)
+  output_file <- file.path(outdir_full, "DE_GSEA_plotting_report.html")
+  
+  print(rmd_path)
+  print(outdir_full)
+  print(output_file)
+  print(de_res_fn)
+  print(method)
+
+  # ---- Build the params list that will be passed into DE_GSEA_plotting.Rmd ----
+  render_params <- list(
+    de_res_fn = de_res_fn,
+    method    = method,
+    outdir    = outdir_full
+  )
+  
+  # ---- Build the R expression that will be run in a separate Rscript
+  # process. deparse() is used (not shQuote) for the same reason as in
+  # server_differential_expr(): this text needs to be valid R source code,
+  # and paths (e.g. these OneDrive paths) may contain spaces or special
+  # characters that must be correctly escaped as R literals. ----
+  render_expr <- sprintf(
+    "rmarkdown::render(input=%s, output_file=%s, output_format='html_document', params=list(de_res_fn=%s, method=%s, outdir=%s), quiet=TRUE)",
+    deparse(rmd_path),
+    deparse(output_file),
+    deparse(render_params$de_res_fn),
+    deparse(render_params$method),
+    deparse(render_params$outdir)
+  )
+  
+  # ---- Assemble the full command as a single string, purely for logging/
+  # inspection — this is what conceptually "runs", even though execution
+  # below uses an argument vector (safer than a shell string) ----
+  full_command <- paste("Rscript -e", shQuote(render_expr))
+  message("Prepared command:\n", full_command)
+  
+  # ---- Execute the command in a separate R process ----
+  result <- system2(
+    command = "Rscript",
+    args    = c("-e", shQuote(render_expr)),
+    stdout  = TRUE,
+    stderr  = TRUE
+  )
+  
+  exit_status <- attr(result, "status")
+  if (!is.null(exit_status) && exit_status != 0) {
+    warning("DE_GSEA_plotting.Rmd render failed (exit status ", exit_status, "):\n",
+            paste(result, collapse = "\n"))
+  } else {
+    message("DE_GSEA_plotting.Rmd render completed.\n", paste(result, collapse = "\n"))
+  }
+  
+  invisible(list(command = full_command, log = result, status = exit_status))
   
 }
 
@@ -141,21 +192,20 @@ server <- function(input, output, session) {
   file_available_db <- reactiveVal(FALSE)
   
   # run database function when submit is pressed
-  observeEvent(input$db_submit_button, {
+  observeEvent(input$de_submit_button, {
     
     
     # run different servers depending on input type selected
     
-    differential_expr_server(input, output, session)
-    #run gsea results
-    gsea_analysis(input, output, session)
+    server_differential_expr(input, output, session)
+    
     
   })
     
   # run integration function when submit is pressed
   observeEvent(input$gsea_submit_button, { 
     # run integration server
-    gsea_analysis(input, output, session)
+    server_gsea_analysis(input, output, session)
       
     
   })

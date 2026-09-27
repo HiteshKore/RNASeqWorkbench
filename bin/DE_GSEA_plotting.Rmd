@@ -1,0 +1,576 @@
+---
+title: "Differential Expression & GSEA Enrichment Plots"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    df_print: paged
+    self_contained: true
+params:
+  de_res_fn:  "/Users/hiteshkore/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/Hitesh_parker_lab/github/downstream_transcriptome_analysis/RNASeqWorkbench/Test_data/Shoaib/IC30-41PRO_IC7-41PRO_gsea.xlsx"
+  method:     "deseq"
+  outdir:     "/Users/hiteshkore/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/Hitesh_parker_lab/github/downstream_transcriptome_analysis/RNASeqWorkbench/Test_data/Shoaib/Final_results/"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,   # hide code from the rendered report
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 9,
+  fig.height = 7
+)
+
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+```
+
+# Overview
+
+This report generates:
+
+1. A **volcano plot** of differential expression (DE) results.
+2. **GSEA/GO enrichment plots** (lollipop or bar style) for Biological
+   Process (BP), Molecular Function (MF), Cellular Component (CC), and
+   MSigDb Hallmark / Immune Signature gene sets.
+
+Every plot is rendered inline below in this single HTML report, and also
+saved to `outdir` as an individual **PDF** file.
+
+```{r params}
+# Pull knit parameters into plain variables for readability below.
+DE_res_fn  <- params$de_res_fn
+method     <- params$method
+outdir     <- params$outdir
+
+# Make sure the output directory exists before we try to save anything into it.
+if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
+```
+
+```{r fn-check-input-columns}
+#' Validate that a data frame has the columns required for a given method.
+#'
+#' @param df     Data frame to check.
+#' @param method Character. Currently supports "deseq".
+#' @return TRUE (invisibly) if valid; otherwise throws an error listing
+#'         which required columns are missing.
+check_input_columns <- function(df, method) {
+
+  if (method == "deseq") {
+    required_columns <- c(
+      "Gene", "baseMean", "log2FoldChange", "lfcSE",
+      "pvalue", "padj", "regulation", "gene_name"
+    )
+
+    missing_columns <- setdiff(required_columns, colnames(df))
+
+    if (length(missing_columns) > 0) {
+      stop(
+        "For method = 'deseq', the following columns are missing: ",
+        paste(missing_columns, collapse = ", ")
+      )
+    }
+  }
+
+  invisible(TRUE)
+}
+
+#' Validate that a data frame contains a set of arbitrary column names.
+#'
+#' Used by the enrichment-plot functions so that a wrong/missing column
+#' name (e.g. a typo in `ratio_col`) fails fast with a clear message,
+#' instead of erroring deep inside ggplot2's internals.
+#'
+#' @param df            Data frame to check.
+#' @param required_cols Character vector of column names to look for.
+#'                       NULL entries (e.g. an unset optional argument)
+#'                       are ignored.
+validate_columns <- function(df, required_cols) {
+  required_cols <- required_cols[!sapply(required_cols, is.null)]
+
+  missing_cols <- setdiff(required_cols, colnames(df))
+
+  if (length(missing_cols) > 0) {
+    stop(
+      "The following column(s) were not found in the data frame: ",
+      paste(missing_cols, collapse = ", "),
+      "\nAvailable columns are: ",
+      paste(colnames(df), collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  invisible(TRUE)
+}
+
+#' Read one sheet from the results workbook, failing with a clear message
+#' (listing the sheets that DO exist) if the requested sheet name isn't found.
+#'
+#' @param path       Path to the .xlsx file.
+#' @param sheet_name Name of the sheet to read.
+#' @return A data frame (tibble) with that sheet's contents.
+read_sheet_safely <- function(path, sheet_name) {
+  available_sheets <- excel_sheets(path)
+
+  if (!sheet_name %in% available_sheets) {
+    stop(
+      "Sheet '", sheet_name, "' not found in ", path,
+      ".\nAvailable sheets are: ", paste(available_sheets, collapse = ", ")
+    )
+  }
+
+  read_excel(path, sheet = sheet_name)
+}
+```
+
+```{r fn-volcano-plot}
+#' Build a publication-style volcano plot.
+#'
+#' @param features          Character vector of feature/gene identifiers.
+#' @param pvalue            Numeric vector of (adjusted) p-values.
+#' @param fold_change       Numeric vector of log2 fold changes.
+#' @param selected_features Character vector of features to label on the
+#'                           plot (only labeled if also significant).
+#' @param lfc_cutoff        |log2FC| threshold used to call up/down (default 1).
+#' @param p_cutoff          p-value significance threshold (default 0.05).
+#' @param title             Plot title.
+#' @param x_breaks_params   Optional c(lower, upper, increment) for the x-axis.
+#'                           If NULL, breaks are computed automatically.
+#' @param y_breaks_params   Optional c(lower, upper, increment) for the y-axis.
+#'                           If NULL, breaks are computed automatically.
+#' @return A ggplot object.
+plot_volcano_plot <- function(features, pvalue, fold_change,
+                               selected_features = NULL,
+                               lfc_cutoff = 1, p_cutoff = 0.05,
+                               title = "Volcano Plot of Differential Expression",
+                               x_breaks_params = NULL,
+                               y_breaks_params = NULL) {
+
+  DE_data <- data.frame(features, pvalue, fold_change) %>% na.omit()
+
+  DE_data$log_p <- -log10(DE_data$pvalue)
+
+  # Classify each feature as up/down/unchanged using the fold-change and
+  # p-value cutoffs supplied above.
+  DE_data$significance <- "Unchanged"
+  DE_data$significance[DE_data$fold_change >  lfc_cutoff & DE_data$pvalue < p_cutoff] <- "Upregulated"
+  DE_data$significance[DE_data$fold_change < -lfc_cutoff & DE_data$pvalue < p_cutoff] <- "Downregulated"
+  DE_data$significance <- factor(DE_data$significance,
+                                  levels = c("Downregulated", "Unchanged", "Upregulated"))
+
+  # Only label features that are both in the user-selected list AND significant,
+  # and nudge labels left/right depending on which side of zero they sit.
+  DE_data <- DE_data %>%
+    mutate(
+      label   = ifelse(features %in% selected_features & significance != "Unchanged",
+                        features, NA),
+      nudge_x = ifelse(fold_change > 0, lfc_cutoff, -lfc_cutoff)
+    )
+
+  n_up   <- sum(DE_data$significance == "Upregulated")
+  n_down <- sum(DE_data$significance == "Downregulated")
+
+  x_max <- max(abs(DE_data$fold_change), na.rm = TRUE) * 1.1
+  y_max <- max(DE_data$log_p, na.rm = TRUE) * 1.1
+
+  # Axis breaks: use user-supplied c(lower, upper, increment) if given,
+  # otherwise fall back to sensible automatic breaks.
+  if (!is.null(x_breaks_params)) {
+    x_breaks <- seq(x_breaks_params[1], x_breaks_params[2], by = x_breaks_params[3])
+    x_lim    <- c(x_breaks_params[1], x_breaks_params[2])
+  } else {
+    x_breaks <- seq(floor(-x_max / 2) * 2, ceiling(x_max / 2) * 2, by = 2)
+    x_lim    <- c(-x_max, x_max)
+  }
+
+  if (!is.null(y_breaks_params)) {
+    y_breaks <- seq(y_breaks_params[1], y_breaks_params[2], by = y_breaks_params[3])
+    y_lim    <- c(y_breaks_params[1], y_breaks_params[2])
+  } else {
+    y_breaks <- seq(0, ceiling(y_max / 3) * 3, by = 3)
+    y_lim    <- c(0, y_max)
+  }
+
+  ggplot(DE_data, aes(x = fold_change, y = log_p, color = significance)) +
+    geom_point(alpha = 0.6, size = 1.8, shape = 16) +
+    scale_color_manual(
+      values = c("Upregulated" = "#D62728",
+                 "Downregulated" = "#1F77B4",
+                 "Unchanged" = "grey75"),
+      drop = FALSE
+    ) +
+    geom_hline(yintercept = -log10(p_cutoff), linetype = "dashed", color = "grey40", linewidth = 0.4) +
+    geom_vline(xintercept = c(-lfc_cutoff, lfc_cutoff), linetype = "dashed", color = "grey40", linewidth = 0.4) +
+    geom_text_repel(
+      aes(label = label),
+      nudge_x = DE_data$nudge_x,
+      direction = "y",
+      size = 3,
+      color = "black",
+      fontface = "italic",
+      box.padding = 0.4,
+      point.padding = 0.3,
+      segment.color = "grey30",
+      segment.size = 0.3,
+      max.overlaps = Inf,
+      min.segment.length = 0
+    ) +
+    annotate("text", x = x_lim[1] * 0.95, y = y_lim[2], label = paste0("Down: ", n_down),
+             hjust = 0, size = 3.5, color = "#1F77B4") +
+    annotate("text", x = x_lim[2] * 0.95, y = y_lim[2], label = paste0("Up: ", n_up),
+             hjust = 1, size = 3.5, color = "#D62728") +
+    labs(
+      title = title,
+      x = expression(log[2] ~ "(Fold Change)"),
+      y = expression(-log[10] ~ "(P value)")
+    ) +
+    coord_cartesian(xlim = x_lim, ylim = y_lim) +
+    scale_x_continuous(breaks = x_breaks) +
+    scale_y_continuous(breaks = y_breaks) +
+    theme_classic(base_size = 13) +
+    theme(
+      legend.position = "top",
+      legend.title = element_blank(),
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      axis.title = element_text(face = "bold")
+    )
+}
+```
+
+```{r fn-go-plots}
+
+#' Generate one enrichment plot for a single results tab.
+#' @param de_res_fn  Path to the results workbook.
+#' @param tab        Sheet name to read (e.g. "BP", "KEGG", "mSigDb_HM").
+#' @param plot_type  "lollipop" or "bar" for this specific tab.
+#' @param title      Plot title.
+#' @param outdir     Directory to save the PDF into.
+#' @param width      PDF export width, in inches.
+#' @param height     PDF export height, in inches.
+#' @param ...        Passed through to plot_go_enrichment() (term_col, ratio_col,
+#'                   pval_col, count_col, color_direction, show_count_label).
+#' @return A ggplot object.
+generate_enrichment_plot <- function(de_res_fn, tab, plot_type, title, outdir,
+                                      width = 9, height = 7, ...) {
+
+  df <- read_sheet_safely(de_res_fn, tab)
+
+  filtered_df <- df %>% filter(include_in_plot == TRUE)
+
+  p <- plot_go_enrichment(
+    filtered_df,
+    plot_type = plot_type,
+    title     = title,
+    ...
+  )
+
+  export_plot(p, paste0("go_", tolower(tab), "_enrichment"), outdir,
+              width = width, height = height)
+
+  p
+}
+# small helper used below: `a %||% b` returns a unless it's NULL, else b
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+#' Read the plot_instructions sheet and generate every enrichment plot it lists,
+#' using each row's own plot type, title, and PDF dimensions.
+#'
+#' Expected columns in the instructions sheet: Tab, Plot_type, Title,
+#' Plot_width, Plot_height. Column names are trimmed of whitespace and
+#' matched case-insensitively, so "Tittle " or "PLOT_TYPE" etc. still work.
+#'
+#' @param de_res_fn          Path to the results workbook.
+#' @param outdir             Directory to save PDFs into.
+#' @param instructions_sheet Name of the sheet mapping Tab -> plot settings
+#'                           (default "plot_instructions").
+#' @param ...                Passed through to plot_go_enrichment() (term_col,
+#'                           ratio_col, pval_col, count_col, color_direction,
+#'                           show_count_label).
+#' @return A named list of ggplot objects, one per tab (names = tab names).
+generate_all_enrichment_plots <- function(de_res_fn, outdir,
+                                           instructions_sheet = "plot_instructions",
+                                           ...) {
+
+  instructions <- read_sheet_safely(de_res_fn, instructions_sheet)
+
+  # Normalise column names: trim whitespace, so a header like "Tittle "
+  # (with a trailing space) is matched reliably.
+  colnames(instructions) <- trimws(colnames(instructions))
+
+  # Map expected logical names -> whatever the actual (trimmed) column is,
+  # matched case-insensitively so "Title"/"TITLE"/"Tittle" all resolve.
+  find_col <- function(df, target) {
+    match_idx <- which(tolower(colnames(df)) == tolower(target))
+    if (length(match_idx) == 0) return(NULL)
+    colnames(df)[match_idx[1]]
+  }
+
+  tab_col    <- find_col(instructions, "Tab")
+  type_col   <- find_col(instructions, "Plot_type")
+  title_col  <- find_col(instructions, "Title")
+  width_col  <- find_col(instructions, "Plot_width")
+  height_col <- find_col(instructions, "Plot_height")
+
+  required <- c(tab = tab_col, plot_type = type_col, title = title_col,
+                width = width_col, height = height_col)
+
+  if (any(sapply(required, is.null))) {
+    stop(
+      "The following required column(s) are missing from '", instructions_sheet,
+      "': ", paste(names(required)[sapply(required, is.null)], collapse = ", "),
+      "\nAvailable columns are: ", paste(colnames(instructions), collapse = ", ")
+    )
+  }
+
+  plots <- setNames(vector("list", nrow(instructions)), instructions[[tab_col]])
+
+  for (i in seq_len(nrow(instructions))) {
+    tab    <- instructions[[tab_col]][i]
+    ptype  <- tolower(trimws(instructions[[type_col]][i]))
+    title  <- instructions[[title_col]][i]
+    width  <- as.numeric(instructions[[width_col]][i])
+    height <- as.numeric(instructions[[height_col]][i])
+
+    plots[[tab]] <- generate_enrichment_plot(
+      de_res_fn = de_res_fn,
+      tab       = tab,
+      plot_type = ptype,
+      title     = title,
+      outdir    = outdir,
+      width     = width,
+      height    = height,
+      ...
+    )
+  }
+
+  plots
+}
+
+
+
+#' Prepare a GSEA/GO results data frame for plotting.
+#'
+#' Handles two shapes of "ratio" column: a GeneRatio-style "5/120" string
+#' (as in enrichGO results), or a plain numeric column (e.g. NES from
+#' gseGO/gseKEGG results). Also derives a gene Count from `core_enrichment`
+#' when no explicit count column is supplied.
+#'
+#' @param df        Enrichment results data frame.
+#' @param ratio_col Name of the column to use for the x-axis (default "NES").
+#' @param count_col Name of the column to size points / label bars by.
+#'                   If NULL, Count is derived from `core_enrichment`.
+#' @return The input data frame with `GeneRatio_num` and `Count` columns added.
+prepare_enrichment_df <- function(df, ratio_col, count_col) {
+
+  plot_df <- df
+
+  if (is.character(plot_df[[ratio_col]])) {
+    # e.g. "5/120" -> 0.0417
+    parts <- strsplit(as.character(plot_df[[ratio_col]]), "/")
+    plot_df$GeneRatio_num <- sapply(parts, function(x) as.numeric(x[1]) / as.numeric(x[2]))
+  } else {
+    plot_df$GeneRatio_num <- plot_df[[ratio_col]]
+  }
+
+  if (is.null(count_col)) {
+    plot_df$Count <- sapply(strsplit(as.character(plot_df$core_enrichment), "/"), length)
+  }
+
+  plot_df
+}
+
+#' Lollipop-style enrichment plot (points on stems, ordered by GeneRatio/NES).
+#'
+#' @param df               Enrichment results data frame.
+#' @param term_col         Column holding the term description (y-axis labels).
+#' @param ratio_col        Column used for the x-axis (default "NES").
+#' @param pval_col         Column used to color points (default "p.adjust").
+#' @param count_col        Column used to size points. NULL derives it from
+#'                         `core_enrichment`.
+#' @param title            Plot title.
+#' @param color_direction  Direction of the viridis color scale (-1 or 1).
+#' @return A ggplot object.
+plot_go_lollipop <- function(df, term_col = "Description", ratio_col = "NES",
+                              pval_col = "p.adjust", count_col = NULL,
+                              title = "GO Enrichment", color_direction = -1) {
+
+  validate_columns(df, c(term_col, ratio_col, pval_col))
+
+  plot_df <- prepare_enrichment_df(df, ratio_col, count_col)
+  if (is.null(count_col)) count_col <- "Count"
+
+  # Order terms by GeneRatio/NES so the plot reads top-to-bottom, largest first.
+  plot_df <- plot_df %>% arrange(desc(GeneRatio_num))
+  plot_df[[term_col]] <- factor(
+    plot_df[[term_col]],
+    levels = rev(plot_df[[term_col]][order(plot_df$GeneRatio_num)])
+  )
+
+  ggplot(plot_df, aes(x = GeneRatio_num, y = .data[[term_col]])) +
+    geom_vline(xintercept = 0, color = "grey40", linewidth = 0.6) +
+    geom_segment(aes(x = 0, xend = GeneRatio_num,
+                      y = .data[[term_col]], yend = .data[[term_col]]),
+                 color = "black", linewidth = 0.5) +
+    geom_point(aes(color = .data[[pval_col]], size = .data[[count_col]])) +
+    scale_color_viridis_c(name = "p.adjust", direction = color_direction) +
+    scale_size_continuous(name = "Count", range = c(2, 8)) +
+    labs(title = title, x = "Gene Ratio", y = NULL) +
+    theme_minimal(base_size = 13) +
+    theme(
+      panel.grid.minor   = element_blank(),
+      panel.grid.major.y = element_blank(),
+      plot.title  = element_text(hjust = 0.5, size = 16),
+      axis.text.y = element_text(color = "grey30"),
+      axis.line.x = element_line(color = "black", linewidth = 0.5),
+      axis.ticks.x = element_line(color = "black")
+    )
+}
+
+#' Bar-style enrichment plot (bars colored by p.adjust, ordered by GeneRatio/NES).
+#'
+#' @inheritParams plot_go_lollipop
+#' @param show_count_label Logical; if TRUE, annotate each bar with its Count.
+#' @return A ggplot object.
+plot_go_barplot <- function(df, term_col = "Description", ratio_col = "NES",
+                             pval_col = "p.adjust", count_col = NULL,
+                             title = "GO Enrichment", color_direction = -1,
+                             show_count_label = TRUE) {
+
+  validate_columns(df, c(term_col, ratio_col, pval_col))
+
+  plot_df <- prepare_enrichment_df(df, ratio_col, count_col)
+  if (is.null(count_col)) count_col <- "Count"
+
+  plot_df <- plot_df %>% arrange(desc(GeneRatio_num))
+  plot_df[[term_col]] <- factor(
+    plot_df[[term_col]],
+    levels = rev(plot_df[[term_col]][order(plot_df$GeneRatio_num)])
+  )
+
+  p <- ggplot(plot_df, aes(x = GeneRatio_num, y = .data[[term_col]])) +
+    geom_vline(xintercept = 0, color = "grey40", linewidth = 0.6) +
+    geom_col(aes(fill = .data[[pval_col]]), width = 0.7, color = "black", linewidth = 0.3) +
+    scale_fill_viridis_c(name = "p.adjust", direction = color_direction) +
+    labs(title = title, x = "Gene Ratio", y = NULL) +
+    theme_minimal(base_size = 13) +
+    theme(
+      panel.grid.minor   = element_blank(),
+      panel.grid.major.y = element_blank(),
+      plot.title  = element_text(hjust = 0.5, size = 16),
+      axis.text.y = element_text(color = "grey30"),
+      axis.line.x = element_line(color = "black", linewidth = 0.5),
+      axis.ticks.x = element_line(color = "black")
+    )
+
+  if (show_count_label) {
+    p <- p + geom_text(
+      aes(label = .data[[count_col]],
+          hjust = ifelse(GeneRatio_num >= 0, -0.2, 1.2)),
+      size = 3, color = "black"
+    )
+  }
+
+  p
+}
+
+#' Dispatch wrapper: build either a lollipop or bar enrichment plot.
+#'
+#' @inheritParams plot_go_lollipop
+#' @param plot_type       One of "lollipop" or "bar".
+#' @param show_count_label Passed through to plot_go_barplot() (ignored for lollipop).
+#' @return A ggplot object.
+plot_go_enrichment <- function(df,
+                                plot_type  = c("lollipop", "bar"),
+                                term_col   = "Description",
+                                ratio_col  = "NES",
+                                pval_col   = "p.adjust",
+                                count_col  = NULL,
+                                title      = "GO Enrichment",
+                                color_direction   = -1,
+                                show_count_label  = TRUE) {
+
+  # match.arg() validates plot_type against the allowed options and gives
+  # a clear error message if an unsupported value (or a typo) is passed.
+  plot_type <- match.arg(plot_type)
+
+  if (plot_type == "lollipop") {
+    plot_go_lollipop(
+      df = df, term_col = term_col, ratio_col = ratio_col,
+      pval_col = pval_col, count_col = count_col,
+      title = title, color_direction = color_direction
+    )
+  } else {
+    plot_go_barplot(
+      df = df, term_col = term_col, ratio_col = ratio_col,
+      pval_col = pval_col, count_col = count_col,
+      title = title, color_direction = color_direction,
+      show_count_label = show_count_label
+    )
+  }
+}
+```
+
+```{r fn-export-plot}
+#' Save a ggplot as a static PDF file in `outdir`. No other files are created.
+#'
+#' @param plot     A ggplot object.
+#' @param filename Base filename (no extension), e.g. "go_bp_enrichment".
+#' @param outdir   Directory to write the PDF into.
+#' @param width,height Dimensions in inches.
+export_plot <- function(plot, filename, outdir, width = 9, height = 7) {
+  pdf_path <- file.path(outdir, paste0(filename, ".pdf"))
+  ggsave(pdf_path, plot = plot, width = width, height = height)
+  invisible(pdf_path)
+}
+```
+
+---
+
+# Load differential expression results
+
+```{r load-de-data}
+DE_data <- read_sheet_safely(DE_res_fn, "DE_genes")
+
+# Fail fast with a clear message if expected columns are missing.
+check_input_columns(DE_data, method)
+```
+
+# Volcano plot
+
+```{r volcano-plot, fig.cap="Volcano plot of differential expression results."}
+highlight_genes <- unique(DE_data$highlight[DE_data$highlight != "None"])
+
+volcano_plot <- plot_volcano_plot(
+  features          = DE_data$gene_name,
+  pvalue            = DE_data$padj,
+  fold_change       = DE_data$log2FoldChange,
+  selected_features = highlight_genes,
+  x_breaks_params   = c(-9, 18, 3),
+  y_breaks_params   = c(0, 35, 5)
+)
+
+volcano_plot
+
+export_plot(volcano_plot, "volcano_plot", outdir)
+```
+
+# GO / GSEA enrichment plots
+
+Generates enrichment plots for biological process, molecular functions, cellular components, hallmarks and immune signatures.
+
+```{r go-bp, fig.cap="Enriched Biological Processes."}
+all_plots <- generate_all_enrichment_plots(DE_res_fn, outdir)
+
+for (tab in names(all_plots)) {
+  cat("\n\n## ", tab, "\n\n")
+  print(all_plots[[tab]])
+  cat("\n\n")
+}
+
+```
+
+
